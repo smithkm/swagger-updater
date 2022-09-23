@@ -1,4 +1,4 @@
-package com.vividsolutions;
+package com.vividsolutions.swaggerupdater;
 
 import static org.junit.Assert.assertTrue;
 
