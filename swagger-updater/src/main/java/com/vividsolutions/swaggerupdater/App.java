@@ -13,6 +13,8 @@ import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.ArrayInitializerExpr;
 import com.github.javaparser.ast.expr.ClassExpr;
 import com.github.javaparser.ast.expr.Expression;
@@ -22,6 +24,7 @@ import com.github.javaparser.ast.expr.Name;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.utils.SourceRoot;
 import com.github.javaparser.utils.SourceRoot.Callback;
 import com.github.javaparser.utils.SourceRoot.Callback.Result;
@@ -29,6 +32,8 @@ import com.github.javaparser.utils.SourceRoot.Callback.Result;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParams;
 import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponses;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameters;
 import io.swagger.v3.oas.annotations.enums.ParameterIn;
@@ -45,8 +50,19 @@ public class App
         return name.asString().startsWith("io.swagger.annotations");
     }
     
-    public static Optional<Expression> annotationValue(NormalAnnotationExpr expr, final String name){
-        return expr.getPairs().stream().filter(pair->pair.getNameAsString().equals(name)).findAny().map(MemberValuePair::getValue);
+    public static Optional<Expression> annotationValue(AnnotationExpr expr, final String name){
+        if(expr.isNormalAnnotationExpr())
+            return expr.asNormalAnnotationExpr().getPairs().stream().filter(pair->pair.getNameAsString().equals(name)).findAny().map(MemberValuePair::getValue);
+        else
+            return Optional.empty();
+    }
+    
+    public static Optional<Expression> annotationValue(AnnotationExpr expr){
+        if(expr.isNormalAnnotationExpr()) {
+            return annotationValue(expr.asNormalAnnotationExpr(), "value");
+        } else {
+            return Optional.of(expr.asSingleMemberAnnotationExpr().getMemberValue());
+        }
     }
     
     public static Expression singleton(ArrayInitializerExpr expr) {
@@ -113,8 +129,32 @@ public class App
                             final var newAnno = new SingleMemberAnnotationExpr(new Name(Parameters.class.getSimpleName()), newParams);
                             anno.replace(newAnno);
                         });
+                        method.getAnnotationByClass(ApiResponses.class).ifPresent(anno->{
+                            var list = annotationValue(anno.asNormalAnnotationExpr(),"value").orElseThrow(()->new IllegalArgumentException(""));
+                            final var newParams = arrayExprMap(list.asArrayInitializerExpr(), oldParam->{
+                                var newParam = new NormalAnnotationExpr();
+                                newParam.setName("ApiResponse");
+                                annotationValue(oldParam.asNormalAnnotationExpr(), "code").ifPresent(value->newParam.addPair("responseCode", new StringLiteralExpr(value.asIntegerLiteralExpr().getValue())));
+                                annotationValue(oldParam.asNormalAnnotationExpr(), "message").ifPresent(value->newParam.addPair("description", value));
+                                
+                                annotationValue(oldParam.asNormalAnnotationExpr(), "response").ifPresent(value->newParam.addPair("content", getContent(value)));
+                                annotationValue(oldParam.asNormalAnnotationExpr(), "responseHeaders").ifPresent(value->newParam.addPair("headers", getHeaders(value)));
+                                annotationValue(oldParam.asNormalAnnotationExpr(), "paramType").ifPresent(value->newParam.addPair("in", getParamType(value)));
+                                return newParam;
+                            });
+                            list.replace(newParams);
+                        });
                     });
                     
+                    cu.walk(Parameter.class, param->{
+                        param.getAnnotationByClass(ApiParam.class).ifPresent(oldAnno->{
+                            var newAnno = new NormalAnnotationExpr();
+                            newAnno.setName("Parameter");
+                            annotationValue(oldAnno).ifPresent(value->newAnno.addPair("description", value));
+                            annotationValue(oldAnno, "name").ifPresent(value->param.addAnnotation(new SingleMemberAnnotationExpr(new Name("QueryParam"), value)));
+                            oldAnno.replace(newAnno);
+                        });
+                    });
                     cu.walk(ImportDeclaration.class, importDecl->{
                         if(importDecl.getName().getQualifier().map(qualifier->qualifier.asString().startsWith("io.swagger.annotations")).orElse(false)) {
                             importDecl.removeForced();
@@ -133,6 +173,7 @@ public class App
                     cu.addImport(io.swagger.v3.oas.annotations.extensions.Extension.class);
                     cu.addImport(io.swagger.v3.oas.annotations.extensions.ExtensionProperty.class);
                     cu.addImport(io.swagger.v3.oas.annotations.headers.Header.class);
+                    cu.addImport("javax.ws.rs.QueryParam");
                     
                     return Result.SAVE;
                 } else {
@@ -143,6 +184,43 @@ public class App
         });
     }
     
+    static ArrayInitializerExpr forceArray(Expression expr) {
+        if(!expr.isArrayInitializerExpr()) {
+            expr = new ArrayInitializerExpr(new NodeList<Expression>(expr));
+        }
+        return (ArrayInitializerExpr)expr;
+    }
+    
+    private static Expression getHeaders(Expression oldAnno) {
+        return arrayExprMap(forceArray(oldAnno), oldHeaderAnno->{
+            var result = new NormalAnnotationExpr();
+            result.setName("Header");
+            
+            annotationValue(oldHeaderAnno.asNormalAnnotationExpr(), "name").ifPresent(value->result.addPair("name", value));
+            annotationValue(oldHeaderAnno.asNormalAnnotationExpr(), "description").ifPresent(value->result.addPair("description", value));
+            annotationValue(oldHeaderAnno.asNormalAnnotationExpr(), "response").ifPresent(value->{
+                var schema = new NormalAnnotationExpr();
+                schema.setName("Schema");
+                schema.addPair("implementation", value);
+                result.addPair("schema",schema);
+            });
+            
+            return result;
+        });
+    }
+
+    private static Expression getContent(Expression value) {
+        var schema = new NormalAnnotationExpr();
+        schema.setName("Schema");
+        schema.addPair("implementation", value);
+        
+        var result = new NormalAnnotationExpr();
+        result.setName("Content");
+        result.addPair("schema", schema);
+        
+        return result;
+    }
+
     private static ClassExpr getClassExpr(Class<?> clazz) {
         var type = StaticJavaParser.parseClassOrInterfaceType(clazz.getSimpleName());
         var result = new ClassExpr(type);
